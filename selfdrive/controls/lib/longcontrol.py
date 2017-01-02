@@ -1,4 +1,5 @@
 import numpy as np
+from common.numpy_fast import clip, interp
 from selfdrive.config import Conversions as CV
 
 class LongCtrlState:
@@ -82,15 +83,18 @@ def get_compute_gb():
 # takes in [desired_accel, current_speed] -> [-1.0, 1.0] where -1.0 is max brake and 1.0 is max gas
 compute_gb = get_compute_gb()
 
+
+_KP_BP = [0., 5., 35.]
+_KP_V =  [1.2, 0.8, 0.5]
+
+_kI_BP = [0., 35.]
+_kI_V =  [0.18, 0.12]
+
 def pid_long_control(v_ego, v_pid, Ui_accel_cmd, gas_max, brake_max, jerk_factor, gear, rate):
   #*** This function compute the gb pedal positions in order to track the desired speed
   # proportional and integral terms. More precision at low speed
-  Kp_v =  [1.2, 0.8, 0.5]
-  Kp_bp = [0., 5., 35.]
-  Kp = np.interp(v_ego, Kp_bp, Kp_v)
-  Ki_v =  [0.18, 0.12]
-  Ki_bp = [0., 35.]
-  Ki = np.interp(v_ego, Ki_bp, Ki_v)
+  Kp = interp(v_ego, _KP_BP, _KP_V)
+  Ki = interp(v_ego, _kI_BP, _kI_V)
 
   # scle Kp and Ki by jerk factor drom drive_thread
   Kp = (1. + jerk_factor)*Kp
@@ -98,7 +102,7 @@ def pid_long_control(v_ego, v_pid, Ui_accel_cmd, gas_max, brake_max, jerk_factor
 
   # this is ugly but can speed reports 0 when speed<0.3m/s and we can't have that jump  
   v_ego_min = 0.3
-  v_ego = np.maximum(v_ego, v_ego_min)
+  v_ego = max(v_ego, v_ego_min)
 
   v_error = v_pid - v_ego
 
@@ -107,7 +111,7 @@ def pid_long_control(v_ego, v_pid, Ui_accel_cmd, gas_max, brake_max, jerk_factor
   accel_cmd_new = Ui_accel_cmd_new + Up_accel_cmd
   output_gb_new = compute_gb([accel_cmd_new, v_ego])
 
-  # Anti-wind up for integrator: only update integrator if we not against the thottle and brake limits
+  # Anti-wind up for integrator: only update integrator if we not against the throttle and brake limits
   # do not wind up if we are changing gear and we are on the gas pedal
   if (((v_error >= 0. and (output_gb_new < gas_max or Ui_accel_cmd < 0)) or
        (v_error <= 0. and (output_gb_new > - brake_max or Ui_accel_cmd > 0))) and
@@ -126,7 +130,7 @@ def pid_long_control(v_ego, v_pid, Ui_accel_cmd, gas_max, brake_max, jerk_factor
   if output_gb > gas_max or output_gb < -brake_max:
     long_control_sat = True
 
-  output_gb = np.clip(output_gb, -brake_max, gas_max)
+  output_gb = clip(output_gb, -brake_max, gas_max)
 
   return output_gb, Up_accel_cmd, Ui_accel_cmd, long_control_sat
 
@@ -136,8 +140,8 @@ starting_brake_rate = 0.6    # brake_travel/s while releasing on restart
 starting_Ui = 0.5            # Since we don't have much info about acceleration at this point, be conservative
 brake_stopping_target = 0.5  # apply at least this amount of brake to maintain the vehicle stationary
 
-max_speed_error_v  = [1.5, .8]  # max positive v_pid error VS actual speed; this avoids controls windup due to slow pedal resp
-max_speed_error_bp = [0., 30.]  # speed breakpoints
+_MAX_SPEED_ERROR_BP = [0., 30.]  # speed breakpoints
+_MAX_SPEED_ERROR_V  = [1.5, .8]  # max positive v_pid error VS actual speed; this avoids controls windup due to slow pedal resp
 
 class LongControl(object):
   def __init__(self):
@@ -151,19 +155,20 @@ class LongControl(object):
     self.Ui_accel_cmd = 0.
     self.v_pid = v_pid
 
-  def update(self, enabled, CS, v_cruise, v_target_lead, a_target, jerk_factor):
-    # TODO: not every time
-    if CS.brake_only:
-      gas_max_v = [0, 0]                # values
-    else:
-      gas_max_v = [0.6, 0.6]            # values
-    gas_max_bp = [0., 100.]             # speeds
-    brake_max_v = [1.0, 1.0, 0.8, 0.8]  # values
+  def update(self, enabled, v_ego, v_cruise, v_target_lead, a_target, jerk_factor, VP):
     brake_max_bp = [0., 5., 20., 100.]  # speeds     
+    brake_max_v = [1.0, 1.0, 0.8, 0.8]  # values
 
     # brake and gas limits
-    brake_max = np.interp(CS.v_ego, brake_max_bp, brake_max_v)
-    gas_max = np.interp(CS.v_ego, gas_max_bp, gas_max_v)
+    brake_max = interp(v_ego, brake_max_bp, brake_max_v)
+
+    # TODO: not every time
+    if VP.brake_only:
+      gas_max = 0
+    else:
+      gas_max_bp = [0., 100.]             # speeds
+      gas_max_v = [0.6, 0.6]            # values
+      gas_max = interp(v_ego, gas_max_bp, gas_max_v)
 
     overshoot_allowance = 2.0    # overshoot allowed when changing accel sign
 
@@ -172,30 +177,30 @@ class LongControl(object):
 
     # limit max target speed based on cruise setting:
     v_cruise_mph = round(v_cruise * CV.KPH_TO_MPH)   # what's displayed in mph on the IC
-    v_target = np.minimum(v_target_lead, v_cruise_mph * CV.MPH_TO_MS / CS.ui_speed_fudge)
+    v_target = min(v_target_lead, v_cruise_mph * CV.MPH_TO_MS / VP.ui_speed_fudge)
 
     max_speed_delta_up = a_target[1]*1.0/rate
     max_speed_delta_down = a_target[0]*1.0/rate
 
     # *** long control substate transitions
-    self.long_control_state = long_control_state_trans(enabled, self.long_control_state, CS.v_ego, v_target, self.v_pid, output_gb)
+    self.long_control_state = long_control_state_trans(enabled, self.long_control_state, v_ego, v_target, self.v_pid, output_gb)
 
     # *** long control behavior based on state
     # TODO: move this to drive_helpers
     # disabled
     if self.long_control_state == LongCtrlState.off:
-      self.v_pid = CS.v_ego # do nothing
+      self.v_pid = v_ego # do nothing
       output_gb = 0.
       self.Ui_accel_cmd = 0.
     # tracking objects and driving
     elif self.long_control_state == LongCtrlState.pid:
       #reset v_pid close to v_ego if it was too far and new v_target is closer to v_ego
-      if ((self.v_pid > CS.v_ego + overshoot_allowance) and
+      if ((self.v_pid > v_ego + overshoot_allowance) and
           (v_target < self.v_pid)):
-        self.v_pid = np.maximum(v_target, CS.v_ego + overshoot_allowance)
-      elif ((self.v_pid < CS.v_ego - overshoot_allowance) and
+        self.v_pid = max(v_target, v_ego + overshoot_allowance)
+      elif ((self.v_pid < v_ego - overshoot_allowance) and
           (v_target > self.v_pid)):
-        self.v_pid = np.minimum(v_target, CS.v_ego - overshoot_allowance)
+        self.v_pid = min(v_target, v_ego - overshoot_allowance)
 
       # move v_pid no faster than allowed accel limits
       if (v_target > self.v_pid + max_speed_delta_up):
@@ -206,27 +211,29 @@ class LongControl(object):
         self.v_pid = v_target
 
       # to avoid too much wind up on acceleration, limit positive speed error
-      if not CS.brake_only:
-        max_speed_error = np.interp(CS.v_ego, max_speed_error_bp, max_speed_error_v)
-        self.v_pid = np.minimum(self.v_pid, CS.v_ego + max_speed_error)
+      if not VP.brake_only:
+        max_speed_error = interp(v_ego, _MAX_SPEED_ERROR_BP, _MAX_SPEED_ERROR_V)
+        self.v_pid = min(self.v_pid, v_ego + max_speed_error)
 
-      output_gb, self.Up_accel_cmd, self.Ui_accel_cmd, self.long_control_sat = pid_long_control(CS.v_ego, self.v_pid, \
-                                  self.Ui_accel_cmd, gas_max, brake_max, jerk_factor, CS.gear, rate)
+      # TODO: removed anti windup on gear change, does it matter?
+      output_gb, self.Up_accel_cmd, self.Ui_accel_cmd, self.long_control_sat = pid_long_control(v_ego, self.v_pid, \
+                                  self.Ui_accel_cmd, gas_max, brake_max, jerk_factor, 0, rate)
     # intention is to stop, switch to a different brake control until we stop
     elif self.long_control_state == LongCtrlState.stopping:
-      if CS.v_ego > 0. or output_gb > -brake_stopping_target or not CS.standstill:
+      if v_ego > 0. or output_gb > -brake_stopping_target:
         output_gb -= stopping_brake_rate/rate
-      output_gb = np.clip(output_gb, -brake_max, gas_max)
-      self.v_pid = CS.v_ego
+      output_gb = clip(output_gb, -brake_max, gas_max)
+      self.v_pid = v_ego
       self.Ui_accel_cmd = 0.
     # intention is to move again, release brake fast before handling control to PID
     elif self.long_control_state == LongCtrlState.starting:
       if output_gb < -0.2:
         output_gb += starting_brake_rate/rate
-      self.v_pid = CS.v_ego
+      self.v_pid = v_ego
       self.Ui_accel_cmd = starting_Ui
 
     self.last_output_gb = output_gb
-    final_gas = np.clip(output_gb, 0., gas_max)
-    final_brake = -np.clip(output_gb, -brake_max, 0.)
+    final_gas = clip(output_gb, 0., gas_max)
+    final_brake = -clip(output_gb, -brake_max, 0.)
     return final_gas, final_brake
+

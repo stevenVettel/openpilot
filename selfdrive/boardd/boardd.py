@@ -18,27 +18,25 @@ except Exception:
 # TODO: rewrite in C to save CPU
 
 # *** serialization functions ***
-def can_list_to_can_capnp(can_msgs):
+def can_list_to_can_capnp(can_msgs, msgtype='can'):
   dat = messaging.new_message()
-  dat.init('can', len(can_msgs))
+  dat.init(msgtype, len(can_msgs))
   for i, can_msg in enumerate(can_msgs):
-    dat.can[i].address = can_msg[0]
-    dat.can[i].busTime = can_msg[1]
-    dat.can[i].dat = can_msg[2]
-    dat.can[i].src = can_msg[3]
+    if msgtype == 'sendcan':
+      cc = dat.sendcan[i]
+    else:
+      cc = dat.can[i]
+    cc.address = can_msg[0]
+    cc.busTime = can_msg[1]
+    cc.dat = can_msg[2]
+    cc.src = can_msg[3]
   return dat
 
-def can_capnp_to_can_list_old(dat, src_filter=[]):
+def can_capnp_to_can_list(can, src_filter=None):
   ret = []
-  for msg in dat.can:
-    if msg.src in src_filter:
-      ret.append([msg.address, msg.busTime, msg.dat.encode("hex")])
-  return ret
-
-def can_capnp_to_can_list(dat):
-  ret = []
-  for msg in dat.can:
-    ret.append([msg.address, msg.busTime, msg.dat, msg.src])
+  for msg in can:
+    if src_filter is None or msg.src in src_filter:
+      ret.append((msg.address, msg.busTime, msg.dat, msg.src))
   return ret
 
 # *** can driver ***

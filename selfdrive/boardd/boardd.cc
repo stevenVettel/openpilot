@@ -4,6 +4,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/time.h>
 #include <sys/cdefs.h>
 #include <sys/types.h>
@@ -26,6 +27,8 @@ int do_exit = 0;
 libusb_context *ctx = NULL;
 libusb_device_handle *dev_handle;
 pthread_mutex_t usb_lock;
+
+bool spoofing_started = false;
 
 // double the FIFO size
 #define RECV_SIZE (0x1000)
@@ -147,7 +150,11 @@ void can_health(void *s) {
   // set fields
   healthData.setVoltage(health.voltage);
   healthData.setCurrent(health.current);
-  healthData.setStarted(health.started);
+  if (spoofing_started) {
+    healthData.setStarted(1);
+  } else {
+    healthData.setStarted(health.started);
+  }
   healthData.setControlsAllowed(health.controls_allowed);
   healthData.setGasInterceptorDetected(health.gas_interceptor_detected);
 
@@ -177,7 +184,7 @@ void can_send(void *s) {
   memset(send, 0, msg_count*0x10);
 
   for (int i = 0; i < msg_count; i++) {
-    auto cmsg = event.getCan()[i];
+    auto cmsg = event.getSendcan()[i];
     if (cmsg.getAddress() >= 0x800) {
       // extended
       send[i*4] = (cmsg.getAddress() << 3) | 5;
@@ -262,13 +269,26 @@ void *can_health_thread(void *crap) {
   return NULL;
 }
 
+int set_realtime_priority(int level) {
+  // should match python using chrt
+  struct sched_param sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sched_priority = level;
+  return sched_setscheduler(gettid(), SCHED_FIFO, &sa);
+}
+
 int main() {
   int err;
   printf("boardd: starting boardd\n");
 
   // set process priority
-  err = setpriority(PRIO_PROCESS, 0, -4);
+  err = set_realtime_priority(4);
   printf("boardd: setpriority returns %d\n", err);
+
+  // check the environment
+  if (getenv("STARTED")) {
+    spoofing_started = true;
+  }
 
   // connect to the board
   err = libusb_init(&ctx);
